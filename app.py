@@ -5,6 +5,8 @@ import time
 import numpy as np
 import requests
 import websockets
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = os.getenv(
@@ -13,13 +15,14 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8695599623")
 SYMBOLS = ["btcusdt", "solusdt"]
 
-# Alert cooldown per symbol (in seconds) to avoid spamming single crossovers
-COOLDOWN_SECONDS = 300  # 5 minutes
+# Global Bot State
+BOT_ACTIVE = True
+COOLDOWN_SECONDS = 300  # 5-minute alert cooldown per symbol
 last_alert_time = {"btcusdt": 0, "solusdt": 0}
 
 
 def send_telegram_alert(message):
-    """Sends real-time trade signal alerts to Telegram."""
+    """Sends alert notifications directly to your Telegram chat."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -32,6 +35,32 @@ def send_telegram_alert(message):
         print(f"\n[ERROR] Telegram send error: {e}")
 
 
+# --- TELEGRAM COMMAND HANDLERS ---
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_ACTIVE
+    BOT_ACTIVE = True
+    user_name = update.effective_user.first_name or "Trader"
+    ack_message = (
+        f"✅ *Command Received:* `/botstart`\n"
+        f"👋 Welcome back, {user_name}!\n\n"
+        f"🟢 *Status:* Trade Scanner is now **ACTIVE**.\n"
+        f"Monitoring live BTC & SOL ticker streams for setups."
+    )
+    await update.message.reply_text(ack_message, parse_mode="Markdown")
+
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_ACTIVE
+    BOT_ACTIVE = False
+    ack_message = (
+        f"✅ *Command Received:* `/botstop`\n\n"
+        f"🔴 *Status:* Trade Scanner is now **PAUSED**.\n"
+        f"Signal notifications are turned off. Send `/botstart` to resume monitoring."
+    )
+    await update.message.reply_text(ack_message, parse_mode="Markdown")
+
+
+# --- TECHNICAL INDICATORS ---
 def calculate_ema(prices, period):
     prices = np.array(prices, dtype=float)
     weights = np.exp(np.linspace(-1.0, 0.0, period))
@@ -68,7 +97,7 @@ def calculate_rsi(prices, period=14):
 
 
 def fetch_historical_prices(symbol):
-    """Fetches recent prices and highs/lows for calculations."""
+    """Fetches candle history to run indicator calculations against live prices."""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1m&limit=50"
     res = requests.get(url).json()
     closes = [float(candle[4]) for candle in res]
@@ -77,36 +106,41 @@ def fetch_historical_prices(symbol):
     return closes, lows, highs
 
 
+# --- MARKET MONITORING ---
 async def monitor_symbol(symbol):
-    # Connect directly to the real-time trade ticker stream
     stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
 
     async with websockets.connect(stream_url) as ws:
-        print(f"[{symbol.upper()}] Monitoring live trade ticks...")
+        print(f"[{symbol.upper()}] Real-time market ticker stream connected...")
 
         while True:
             response = await ws.recv()
+
+            # Skip calculation if scanner is paused via /botstop
+            if not BOT_ACTIVE:
+                await asyncio.sleep(1)
+                continue
+
             data = json.loads(response)
             live_price = float(data["p"])
 
             now = time.time()
             if now - last_alert_time[symbol] < COOLDOWN_SECONDS:
-                continue  # Skip evaluation if in cooldown window
+                continue
 
             closes, lows, highs = fetch_historical_prices(symbol)
-            closes[-1] = live_price  # Replace latest candle close with live price
+            closes[-1] = live_price  # Bind live ticker to current candles
 
             ema9 = calculate_ema(closes, 9)
             ema21 = calculate_ema(closes, 21)
             rsi = calculate_rsi(closes, 14)
 
-            # Bullish Trigger
+            # Bullish Crossover Setup
             if ema9 > ema21 and rsi < 68:
-                sl = min(lows[-5:])  # Local swing low
+                sl = min(lows[-5:])  # Swing low SL
                 risk = live_price - sl
                 if risk > 0:
-                    tp = live_price + (risk * 1.5)  # 1:1.5 Risk-to-Reward Ratio
-
+                    tp = live_price + (risk * 1.5)  # 1:1.5 RR TP
                     msg = (
                         f"🟢 *REAL-TIME BULLISH SETUP ({symbol.upper()})*\n\n"
                         f"• *Entry Price:* ${live_price:,.2f}\n"
@@ -118,13 +152,12 @@ async def monitor_symbol(symbol):
                     send_telegram_alert(msg)
                     last_alert_time[symbol] = now
 
-            # Bearish Trigger
+            # Bearish Crossover Setup
             elif ema9 < ema21 and rsi > 32:
-                sl = max(highs[-5:])  # Local swing high
+                sl = max(highs[-5:])  # Swing high SL
                 risk = sl - live_price
                 if risk > 0:
-                    tp = live_price - (risk * 1.5)  # 1:1.5 Risk-to-Reward Ratio
-
+                    tp = live_price - (risk * 1.5)  # 1:1.5 RR TP
                     msg = (
                         f"🔴 *REAL-TIME BEARISH SETUP ({symbol.upper()})*\n\n"
                         f"• *Entry Price:* ${live_price:,.2f}\n"
@@ -138,9 +171,21 @@ async def monitor_symbol(symbol):
 
 
 async def main():
+    # Initialize Telegram command listeners
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("botstart", start_cmd))
+    app.add_handler(CommandHandler("botstop", stop_cmd))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
     send_telegram_alert(
-        "⚡ *Instant Trade Scanner Online*\nMonitoring live BTC & SOL trades with instant TP/SL setup generation."
+        "⚡ *Instant Trade Scanner Online*\n"
+        "Send `/botstart` to begin receiving setups or `/botstop` to pause."
     )
+
+    # Launch live ticker streams
     await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
 
 
