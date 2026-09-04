@@ -11,17 +11,23 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- CONFIGURATION ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", "8811292743:AAEJBiVXN7j0hysvOpx7TjqHnN44goXX_-o"
+)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8695599623")
 SYMBOLS = ["btcusdt", "solusdt"]
 
-# Valid timeframes under 30m
-EXECUTION_TIMEFRAME = "5m"  # Options: 1m, 3m, 5m, 15m
-BIAS_TIMEFRAME = "30m"      # Higher timeframe bias confirmation
+MAX_ACTIVE_TRADES = 3
+EXECUTION_TIMEFRAME = "5m"
+BIAS_TIMEFRAME = "15m"
 
 BOT_ACTIVE = True
-COOLDOWN_SECONDS = 600       # 10 minute cooldown for higher quality setups
+COOLDOWN_SECONDS = 60  # Reduced to 1 min to ensure setups trigger reliably
 last_alert_time = {s: 0 for s in SYMBOLS}
+
+# State Management
+active_positions = {}
+latest_prices = {s: 0.0 for s in SYMBOLS}
 
 
 def send_telegram_alert(message):
@@ -32,14 +38,13 @@ def send_telegram_alert(message):
         "parse_mode": "Markdown",
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"\n[ERROR] Telegram send error: {e}")
 
 
 def handle_exit_signal(sig, frame):
-    print("[SYSTEM] Shutdown signal received. Alerting Telegram...")
-    send_telegram_alert("⚠️ *OROCHI SYSTEM ALERT: Bot is going OFFLINE.*")
+    print("[SYSTEM] Exit signal received.")
     sys.exit(0)
 
 
@@ -47,14 +52,78 @@ signal.signal(signal.SIGINT, handle_exit_signal)
 signal.signal(signal.SIGTERM, handle_exit_signal)
 
 
+# --- TELEGRAM COMMAND HANDLERS ---
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_ACTIVE
+    BOT_ACTIVE = True
+    await update.message.reply_text("🟢 *Orochi Position Manager Active*", parse_mode="Markdown")
+
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_ACTIVE
+    BOT_ACTIVE = False
+    await update.message.reply_text("🔴 *Orochi Position Manager Paused*", parse_mode="Markdown")
+
+
+async def trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays real-time open positions, entry prices, and live P/L."""
+    if not active_positions:
+        await update.message.reply_text(
+            f"ℹ️ *No active positions.* Searching for setups...\n"
+            f"• *Slot Usage:* `0/{MAX_ACTIVE_TRADES}`\n"
+            f"• *BTC Price:* `${latest_prices.get('btcusdt', 0):,.2f}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = f"📊 *ACTIVE POSITIONS ({len(active_positions)}/{MAX_ACTIVE_TRADES})*\n\n"
+    for symbol, pos in list(active_positions.items()):
+        curr_price = latest_prices.get(symbol, pos["entry"])
+        direction = pos["type"]
+        entry = pos["entry"]
+        lev = pos["lev"]
+
+        if direction == "BULLISH":
+            pnl_pct = ((curr_price - entry) / entry) * 100
+        else:
+            pnl_pct = ((entry - curr_price) / entry) * 100
+
+        roe = pnl_pct * lev
+        status_icon = "🟢" if roe >= 0 else "🔴"
+
+        msg += (
+            f"{status_icon} *{symbol.upper()}* ({direction})\n"
+            f"• *Entry:* ${entry:,.2f} | *Current:* ${curr_price:,.2f}\n"
+            f"• *Leverage:* `{lev}x`\n"
+            f"• *Unrealized P/L:* `{pnl_pct:+.2f}%` (`{roe:+.2f}% ROE`)\n"
+            f"• *SL:* ${pos['sl']:,.2f} | *TP3:* ${pos['tp3']:,.2f}\n\n"
+        )
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually closes all tracked positions."""
+    global active_positions
+    count = len(active_positions)
+    active_positions.clear()
+    await update.message.reply_text(
+        f"🚨 *Closed all {count} active positions.* Trade slots reset to 0/{MAX_ACTIVE_TRADES}.",
+        parse_mode="Markdown"
+    )
+
+
 # --- ASYNCHRONOUS DATA FETCHING ---
 def _fetch_klines_sync(symbol, interval, limit=50):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
-    res = requests.get(url, timeout=3).json()
-    highs = [float(c[2]) for c in res]
-    lows = [float(c[3]) for c in res]
-    closes = [float(c[4]) for c in res]
-    return highs, lows, closes
+    try:
+        res = requests.get(url, timeout=5).json()
+        highs = [float(c[2]) for c in res]
+        lows = [float(c[3]) for c in res]
+        closes = [float(c[4]) for c in res]
+        return highs, lows, closes
+    except Exception:
+        return [], [], []
 
 
 async def fetch_klines(symbol, interval, limit=50):
@@ -62,159 +131,207 @@ async def fetch_klines(symbol, interval, limit=50):
 
 
 # --- TECHNICAL ANALYSIS ENGINE ---
-def calculate_ema(prices, period=50):
+def calculate_ema(prices, period=20):
+    if len(prices) < period:
+        return prices[-1] if len(prices) > 0 else 0
     prices = np.array(prices, dtype=float)
     weights = np.exp(np.linspace(-1.0, 0.0, period))
     weights /= weights.sum()
-    return np.convolve(prices, weights, mode="full")[len(prices) - 1]
+    return float(np.convolve(prices, weights, mode="valid")[-1])
 
 
-def check_liquidity_sweep(highs, lows):
-    """Detects if recent price action swept recent swing highs/lows for liquidity traps."""
-    prev_high = max(highs[-20:-5])
-    prev_low = min(lows[-20:-5])
+def detect_structure(highs, lows, closes):
+    if len(closes) < 15:
+        return None, 0
     
-    swept_bullish = lows[-1] < prev_low and closes_higher(lows)
-    swept_bearish = highs[-1] > prev_high and closes_lower(highs)
-    
-    return swept_bullish, swept_bearish
-
-
-def closes_higher(lows):
-    return lows[-1] > lows[-2]
-
-
-def closes_lower(highs):
-    return highs[-1] < highs[-2]
-
-
-def detect_structure_break(highs, lows, closes):
-    recent_high = max(highs[-15:-2])
-    recent_low = min(lows[-15:-2])
+    recent_high = max(highs[-15:-1])
+    recent_low = min(lows[-15:-1])
     current_close = closes[-1]
 
     if current_close > recent_high:
-        return "BULLISH_BOS", recent_low
+        return "BULLISH", recent_low
     if current_close < recent_low:
-        return "BEARISH_BOS", recent_high
+        return "BEARISH", recent_high
 
     return None, 0
+
+
+def check_active_trade_exits(symbol, live_price):
+    if symbol not in active_positions:
+        return
+
+    pos = active_positions[symbol]
+    direction = pos["type"]
+    sl = pos["sl"]
+    tp3 = pos["tp3"]
+
+    if direction == "BULLISH":
+        if live_price <= sl:
+            send_telegram_alert(f"🔴 *STOP LOSS HIT ({symbol.upper()})*\nClosed position at ${live_price:,.2f}.")
+            del active_positions[symbol]
+        elif live_price >= tp3:
+            send_telegram_alert(f"🎯 *TP3 HIT ({symbol.upper()})*\nFully closed trade at ${live_price:,.2f}.")
+            del active_positions[symbol]
+
+    elif direction == "BEARISH":
+        if live_price >= sl:
+            send_telegram_alert(f"🔴 *STOP LOSS HIT ({symbol.upper()})*\nClosed position at ${live_price:,.2f}.")
+            del active_positions[symbol]
+        elif live_price <= tp3:
+            send_telegram_alert(f"🎯 *TP3 HIT ({symbol.upper()})*\nFully closed trade at ${live_price:,.2f}.")
+            del active_positions[symbol]
 
 
 async def monitor_symbol(symbol):
     stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
 
-    async with websockets.connect(stream_url) as ws:
-        print(f"[{symbol.upper()}] High-Precision SMC Engine Active...")
+    while True:
+        try:
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=10) as ws:
+                print(f"[{symbol.upper()}] Real-time stream active.")
 
-        while True:
-            response = await ws.recv()
-            if not BOT_ACTIVE:
-                await asyncio.sleep(1)
-                continue
+                while True:
+                    response = await ws.recv()
+                    if not BOT_ACTIVE:
+                        await asyncio.sleep(1)
+                        continue
 
-            data = json.loads(response)
-            live_price = float(data["p"])
+                    data = json.loads(response)
+                    live_price = float(data["p"])
+                    latest_prices[symbol] = live_price
 
-            now = time.time()
-            if now - last_alert_time[symbol] < COOLDOWN_SECONDS:
-                continue
+                    check_active_trade_exits(symbol, live_price)
 
-            # Step 1: Check Higher Timeframe Trend Bias (30m)
-            htf_highs, htf_lows, htf_closes = await fetch_klines(symbol, BIAS_TIMEFRAME)
-            htf_ema = calculate_ema(htf_closes, 50)
-            htf_bullish = live_price > htf_ema
-            htf_bearish = live_price < htf_ema
+                    if len(active_positions) >= MAX_ACTIVE_TRADES or symbol in active_positions:
+                        await asyncio.sleep(0.2)
+                        continue
 
-            # Step 2: Fetch Execution Timeframe Data (1m - 15m)
-            ltf_highs, ltf_lows, ltf_closes = await fetch_klines(symbol, EXECUTION_TIMEFRAME)
-            ltf_closes[-1] = live_price
+                    now = time.time()
+                    if now - last_alert_time[symbol] < COOLDOWN_SECONDS:
+                        await asyncio.sleep(0.2)
+                        continue
 
-            swept_bullish, swept_bearish = check_liquidity_sweep(ltf_highs, ltf_lows)
-            structure_signal, invalidation = detect_structure_break(ltf_highs, ltf_lows, ltf_closes)
+                    htf_highs, htf_lows, htf_closes = await fetch_klines(symbol, BIAS_TIMEFRAME)
+                    ltf_highs, ltf_lows, ltf_closes = await fetch_klines(symbol, EXECUTION_TIMEFRAME)
 
-            # --- HIGH PROBABILITY BULLISH ENTRY (Targeting TP2-TP3 Hitrate) ---
-            if htf_bullish and swept_bullish and structure_signal == "BULLISH_BOS":
-                sl = invalidation
-                risk = live_price - sl
-                sl_pct = (risk / live_price) * 100
+                    if not htf_closes or not ltf_closes:
+                        continue
 
-                # Strict Quality Gate: Stop loss must be structural, not micro-noise
-                if 0.15 <= sl_pct <= 1.2:
-                    # Dynamic Leverage to achieve 2% to 10% ROE targeting TP2/TP3
-                    recommended_leverage = min(max(int(5 / sl_pct), 2), 20)
+                    htf_ema = calculate_ema(htf_closes, 20)
+                    bias_bullish = live_price > htf_ema
+                    bias_bearish = live_price < htf_ema
 
-                    tp1 = live_price + (risk * 1.0)  # Move SL to Breakeven
-                    tp2 = live_price + (risk * 2.0)  # Primary Target (High Hitrate)
-                    tp3 = live_price + (risk * 3.5)  # Extended Runner
+                    ltf_closes[-1] = live_price
+                    signal_type, invalidation = detect_structure(ltf_highs, ltf_lows, ltf_closes)
 
-                    roe_tp1 = (risk * 1.0 / live_price) * 100 * recommended_leverage
-                    roe_tp2 = (risk * 2.0 / live_price) * 100 * recommended_leverage
-                    roe_tp3 = (risk * 3.5 / live_price) * 100 * recommended_leverage
+                    # --- BULLISH ENTRY ---
+                    if bias_bullish and signal_type == "BULLISH" and invalidation > 0:
+                        sl = invalidation
+                        risk = live_price - sl
+                        if risk > 0:
+                            sl_pct = (risk / live_price) * 100
 
-                    confidence = 92  # High structural convergence score
+                            if 0.05 <= sl_pct <= 2.5:
+                                rec_leverage = min(max(int(5 / sl_pct), 2), 20)
 
-                    msg = (
-                        f"⚡ *OROCHI SMC BULLISH SETUP ({symbol.upper()})*\n"
-                        f"⏳ *Timeframe:* `{EXECUTION_TIMEFRAME}` (Bias: `{BIAS_TIMEFRAME}`)\n"
-                        f"🎯 *Confidence Rate:* `{confidence}%`\n"
-                        f"⚡ *Recommended Leverage:* `{recommended_leverage}x` Cross\n\n"
-                        f"• *Entry:* ${live_price:,.2f}\n"
-                        f"• *Stop Loss:* ${sl:,.2f} (-{sl_pct:.2f}%)\n\n"
-                        f"🎯 *TP 1 (25% position):* ${tp1:,.2f} (+{roe_tp1:.1f}% ROE) | 1:1.0 RR\n"
-                        f"🎯 *TP 2 (50% position):* ${tp2:,.2f} (+{roe_tp2:.1f}% ROE) | 1:2.0 RR\n"
-                        f"🎯 *TP 3 (25% position):* ${tp3:,.2f} (+{roe_tp3:.1f}% ROE) | 1:3.5 RR\n\n"
-                        f"🛡️ *Trade Management:* Move SL to entry after TP1 hits."
-                    )
-                    send_telegram_alert(msg)
-                    last_alert_time[symbol] = now
+                                tp1 = live_price + (risk * 1.2)
+                                tp2 = live_price + (risk * 2.2)
+                                tp3 = live_price + (risk * 3.5)
 
-            # --- HIGH PROBABILITY BEARISH ENTRY ---
-            elif htf_bearish and swept_bearish and structure_signal == "BEARISH_BOS":
-                sl = invalidation
-                risk = sl - live_price
-                sl_pct = (risk / live_price) * 100
+                                roe1 = (risk * 1.2 / live_price) * 100 * rec_leverage
+                                roe2 = (risk * 2.2 / live_price) * 100 * rec_leverage
+                                roe3 = (risk * 3.5 / live_price) * 100 * rec_leverage
 
-                if 0.15 <= sl_pct <= 1.2:
-                    recommended_leverage = min(max(int(5 / sl_pct), 2), 20)
+                                active_positions[symbol] = {
+                                    "type": "BULLISH",
+                                    "entry": live_price,
+                                    "sl": sl,
+                                    "tp1": tp1,
+                                    "tp2": tp2,
+                                    "tp3": tp3,
+                                    "lev": rec_leverage,
+                                }
 
-                    tp1 = live_price - (risk * 1.0)
-                    tp2 = live_price - (risk * 2.0)
-                    tp3 = live_price - (risk * 3.5)
+                                msg = (
+                                    f"⚡ *OROCHI SMC BULLISH SETUP ({symbol.upper()})*\n"
+                                    f"📌 *Active Slots:* `{len(active_positions)}/{MAX_ACTIVE_TRADES}`\n"
+                                    f"⏳ *Timeframe:* `{EXECUTION_TIMEFRAME}` | *Bias:* `{BIAS_TIMEFRAME}`\n"
+                                    f"⚡ *Leverage:* `{rec_leverage}x` Cross\n\n"
+                                    f"• *Entry:* ${live_price:,.2f}\n"
+                                    f"• *Stop Loss:* ${sl:,.2f} (-{sl_pct:.2f}%)\n\n"
+                                    f"🎯 *TP 1 (25%):* ${tp1:,.2f} (+{roe1:.1f}% ROE)\n"
+                                    f"🎯 *TP 2 (50%):* ${tp2:,.2f} (+{roe2:.1f}% ROE)\n"
+                                    f"🎯 *TP 3 (25%):* ${tp3:,.2f} (+{roe3:.1f}% ROE)"
+                                )
+                                send_telegram_alert(msg)
+                                last_alert_time[symbol] = now
 
-                    roe_tp1 = (risk * 1.0 / live_price) * 100 * recommended_leverage
-                    roe_tp2 = (risk * 2.0 / live_price) * 100 * recommended_leverage
-                    roe_tp3 = (risk * 3.5 / live_price) * 100 * recommended_leverage
+                    # --- BEARISH ENTRY ---
+                    elif bias_bearish and signal_type == "BEARISH" and invalidation > 0:
+                        sl = invalidation
+                        risk = sl - live_price
+                        if risk > 0:
+                            sl_pct = (risk / live_price) * 100
 
-                    confidence = 94
+                            if 0.05 <= sl_pct <= 2.5:
+                                rec_leverage = min(max(int(5 / sl_pct), 2), 20)
 
-                    msg = (
-                        f"⚡ *OROCHI SMC BEARISH SETUP ({symbol.upper()})*\n"
-                        f"⏳ *Timeframe:* `{EXECUTION_TIMEFRAME}` (Bias: `{BIAS_TIMEFRAME}`)\n"
-                        f"🎯 *Confidence Rate:* `{confidence}%`\n"
-                        f"⚡ *Recommended Leverage:* `{recommended_leverage}x` Cross\n\n"
-                        f"• *Entry:* ${live_price:,.2f}\n"
-                        f"• *Stop Loss:* ${sl:,.2f} (-{sl_pct:.2f}%)\n\n"
-                        f"🎯 *TP 1 (25% position):* ${tp1:,.2f} (+{roe_tp1:.1f}% ROE) | 1:1.0 RR\n"
-                        f"🎯 *TP 2 (50% position):* ${tp2:,.2f} (+{roe_tp2:.1f}% ROE) | 1:2.0 RR\n"
-                        f"🎯 *TP 3 (25% position):* ${tp3:,.2f} (+{roe_tp3:.1f}% ROE) | 1:3.5 RR\n\n"
-                        f"🛡️ *Trade Management:* Move SL to entry after TP1 hits."
-                    )
-                    send_telegram_alert(msg)
-                    last_alert_time[symbol] = now
+                                tp1 = live_price - (risk * 1.2)
+                                tp2 = live_price - (risk * 2.2)
+                                tp3 = live_price - (risk * 3.5)
+
+                                roe1 = (risk * 1.2 / live_price) * 100 * rec_leverage
+                                roe2 = (risk * 2.2 / live_price) * 100 * rec_leverage
+                                roe3 = (risk * 3.5 / live_price) * 100 * rec_leverage
+
+                                active_positions[symbol] = {
+                                    "type": "BEARISH",
+                                    "entry": live_price,
+                                    "sl": sl,
+                                    "tp1": tp1,
+                                    "tp2": tp2,
+                                    "tp3": tp3,
+                                    "lev": rec_leverage,
+                                }
+
+                                msg = (
+                                    f"⚡ *OROCHI SMC BEARISH SETUP ({symbol.upper()})*\n"
+                                    f"📌 *Active Slots:* `{len(active_positions)}/{MAX_ACTIVE_TRADES}`\n"
+                                    f"⏳ *Timeframe:* `{EXECUTION_TIMEFRAME}` | *Bias:* `{BIAS_TIMEFRAME}`\n"
+                                    f"⚡ *Leverage:* `{rec_leverage}x` Cross\n\n"
+                                    f"• *Entry:* ${live_price:,.2f}\n"
+                                    f"• *Stop Loss:* ${sl:,.2f} (-{sl_pct:.2f}%)\n\n"
+                                    f"🎯 *TP 1 (25%):* ${tp1:,.2f} (+{roe1:.1f}% ROE)\n"
+                                    f"🎯 *TP 2 (50%):* ${tp2:,.2f} (+{roe2:.1f}% ROE)\n"
+                                    f"🎯 *TP 3 (25%):* ${tp3:,.2f} (+{roe3:.1f}% ROE)"
+                                )
+                                send_telegram_alert(msg)
+                                last_alert_time[symbol] = now
+
+        except Exception as e:
+            print(f"[{symbol.upper()}] Stream reconnecting ({e})...")
+            await asyncio.sleep(3)
 
 
 async def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("botstart", start_cmd))
+    app.add_handler(CommandHandler("botstop", stop_cmd))
+    app.add_handler(CommandHandler("trades", trades_cmd))
+    app.add_handler(CommandHandler("close", close_cmd))
+
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    await app.updater.start_polling(drop_pending_updates=True)
 
-    send_telegram_alert(
-        f"🐉 *Orochi Framework Online*\n"
-        f"Scanning on `{EXECUTION_TIMEFRAME}` charts. Higher timeframe trend alignment & liquidity sweeps enforced for max TP2-TP3 hit rate."
-    )
-    await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
+    for symbol in SYMBOLS:
+        asyncio.create_task(monitor_symbol(symbol))
+
+    send_telegram_alert("🐉 *Orochi Manager Online*\nUse /trades for active positions or /close to reset.")
+
+    # Event loop yield: keep execution unblocked for Telegram updates
+    while True:
+        await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
