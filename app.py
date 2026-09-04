@@ -15,14 +15,12 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8695599623")
 SYMBOLS = ["btcusdt", "solusdt"]
 
-# Global Bot State
 BOT_ACTIVE = True
-COOLDOWN_SECONDS = 300  # 5-minute alert cooldown per symbol
+COOLDOWN_SECONDS = 300
 last_alert_time = {"btcusdt": 0, "solusdt": 0}
 
 
 def send_telegram_alert(message):
-    """Sends alert notifications directly to your Telegram chat."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -35,88 +33,69 @@ def send_telegram_alert(message):
         print(f"\n[ERROR] Telegram send error: {e}")
 
 
-# --- TELEGRAM COMMAND HANDLERS ---
+# --- TELEGRAM CONTROLS ---
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
-    user_name = update.effective_user.first_name or "Trader"
-    ack_message = (
-        f"✅ *Command Received:* `/botstart`\n"
-        f"👋 Welcome back, {user_name}!\n\n"
-        f"🟢 *Status:* Trade Scanner is now **ACTIVE**.\n"
-        f"Monitoring live BTC & SOL ticker streams for setups."
+    await update.message.reply_text(
+        "🟢 *Orochi Framework Scanner Active*\nMonitoring market structure, FVGs, and Order Blocks.",
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(ack_message, parse_mode="Markdown")
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = False
-    ack_message = (
-        f"✅ *Command Received:* `/botstop`\n\n"
-        f"🔴 *Status:* Trade Scanner is now **PAUSED**.\n"
-        f"Signal notifications are turned off. Send `/botstart` to resume monitoring."
+    await update.message.reply_text(
+        "🔴 *Orochi Framework Scanner Paused*\nNotifications disabled.",
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(ack_message, parse_mode="Markdown")
 
 
-# --- TECHNICAL INDICATORS ---
-def calculate_ema(prices, period):
-    prices = np.array(prices, dtype=float)
-    weights = np.exp(np.linspace(-1.0, 0.0, period))
-    weights /= weights.sum()
-    ema = np.convolve(prices, weights, mode="full")[: len(prices)]
-    ema[:period] = ema[period]
-    return ema[-1]
-
-
-def calculate_rsi(prices, period=14):
-    deltas = np.diff(prices)
-    seed = deltas[: period + 1]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else 0
-    rsi = np.zeros_like(prices)
-    rsi[:period] = 100.0 - (100.0 / (1.0 + rs))
-
-    for i in range(period, len(prices)):
-        delta = deltas[i - 1]
-        if delta > 0:
-            upval = delta
-            downval = 0.0
-        else:
-            upval = 0.0
-            downval = -delta
-
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down if down != 0 else 0
-        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-
-    return rsi[-1]
-
-
-def fetch_historical_prices(symbol):
-    """Fetches candle history to run indicator calculations against live prices."""
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1m&limit=50"
+# --- OROCHI / SMC ANALYSIS ENGINE ---
+def fetch_klines(symbol, limit=50):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1m&limit={limit}"
     res = requests.get(url).json()
-    closes = [float(candle[4]) for candle in res]
-    lows = [float(candle[3]) for candle in res]
-    highs = [float(candle[2]) for candle in res]
-    return closes, lows, highs
+    opens = [float(c[1]) for c in res]
+    highs = [float(c[2]) for c in res]
+    lows = [float(c[3]) for c in res]
+    closes = [float(c[4]) for c in res]
+    return opens, highs, lows, closes
 
 
-# --- MARKET MONITORING ---
+def detect_fvg(opens, highs, lows, closes):
+    """Detects Bullish or Bearish Fair Value Gaps in recent candles."""
+    # Bullish FVG: Low of candle[i] > High of candle[i-2]
+    if lows[-1] > highs[-3]:
+        return "BULLISH_FVG", highs[-3], lows[-1]
+    # Bearish FVG: High of candle[i] < Low of candle[i-2]
+    if highs[-1] < lows[-3]:
+        return "BEARISH_FVG", lows[-3], highs[-1]
+    return None, 0, 0
+
+
+def detect_structure_break(highs, lows, closes):
+    """Detects Break of Structure (BOS) or Change of Character (CHoCH)."""
+    recent_high = max(highs[-15:-2])
+    recent_low = min(lows[-15:-2])
+    current_close = closes[-1]
+
+    if current_close > recent_high:
+        return "BULLISH_BOS", recent_low
+    if current_close < recent_low:
+        return "BEARISH_BOS", recent_high
+
+    return None, 0
+
+
 async def monitor_symbol(symbol):
     stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
 
     async with websockets.connect(stream_url) as ws:
-        print(f"[{symbol.upper()}] Real-time market ticker stream connected...")
+        print(f"[{symbol.upper()}] Orochi Structure Stream Connected...")
 
         while True:
             response = await ws.recv()
-
-            # Skip calculation if scanner is paused via /botstop
             if not BOT_ACTIVE:
                 await asyncio.sleep(1)
                 continue
@@ -128,50 +107,52 @@ async def monitor_symbol(symbol):
             if now - last_alert_time[symbol] < COOLDOWN_SECONDS:
                 continue
 
-            closes, lows, highs = fetch_historical_prices(symbol)
-            closes[-1] = live_price  # Bind live ticker to current candles
+            opens, highs, lows, closes = fetch_klines(symbol)
+            closes[-1] = live_price  # Bind live price to active candle
 
-            ema9 = calculate_ema(closes, 9)
-            ema21 = calculate_ema(closes, 21)
-            rsi = calculate_rsi(closes, 14)
+            fvg_type, fvg_low, fvg_high = detect_fvg(opens, highs, lows, closes)
+            structure_signal, invalidation_level = detect_structure_break(
+                highs, lows, closes
+            )
 
-            # Bullish Crossover Setup
-            if ema9 > ema21 and rsi < 68:
-                sl = min(lows[-5:])  # Swing low SL
+            # --- BULLISH SETUP: Bullish BOS + Bullish FVG ---
+            if structure_signal == "BULLISH_BOS" and fvg_type == "BULLISH_FVG":
+                sl = invalidation_level
                 risk = live_price - sl
                 if risk > 0:
-                    tp = live_price + (risk * 1.5)  # 1:1.5 RR TP
+                    tp = live_price + (risk * 1.5)
                     msg = (
-                        f"🟢 *REAL-TIME BULLISH SETUP ({symbol.upper()})*\n\n"
-                        f"• *Entry Price:* ${live_price:,.2f}\n"
-                        f"• *Stop Loss (SL):* ${sl:,.2f}\n"
-                        f"• *Take Profit (TP):* ${tp:,.2f} (1:1.5 RR)\n\n"
-                        f"• *Signal:* 9 EMA crossed above 21 EMA\n"
-                        f"• *RSI (14):* {rsi:.1f}"
+                        f"⚡ *OROCHI SMC SETUP ({symbol.upper()})*\n"
+                        f"🔥 *Signal:* Bullish BOS + FVG Expansion\n\n"
+                        f"• *Entry:* ${live_price:,.2f}\n"
+                        f"• *Stop Loss:* ${sl:,.2f} (Swing Low)\n"
+                        f"• *Take Profit:* ${tp:,.2f} (1:1.5 RR)\n\n"
+                        f"• *FVG Imbalance Zone:* ${fvg_low:,.2f} - ${fvg_high:,.2f}"
                     )
                     send_telegram_alert(msg)
                     last_alert_time[symbol] = now
 
-            # Bearish Crossover Setup
-            elif ema9 < ema21 and rsi > 32:
-                sl = max(highs[-5:])  # Swing high SL
+            # --- BEARISH SETUP: Bearish BOS + Bearish FVG ---
+            elif (
+                structure_signal == "BEARISH_BOS" and fvg_type == "BEARISH_FVG"
+            ):
+                sl = invalidation_level
                 risk = sl - live_price
                 if risk > 0:
-                    tp = live_price - (risk * 1.5)  # 1:1.5 RR TP
+                    tp = live_price - (risk * 1.5)
                     msg = (
-                        f"🔴 *REAL-TIME BEARISH SETUP ({symbol.upper()})*\n\n"
-                        f"• *Entry Price:* ${live_price:,.2f}\n"
-                        f"• *Stop Loss (SL):* ${sl:,.2f}\n"
-                        f"• *Take Profit (TP):* ${tp:,.2f} (1:1.5 RR)\n\n"
-                        f"• *Signal:* 9 EMA crossed below 21 EMA\n"
-                        f"• *RSI (14):* {rsi:.1f}"
+                        f"⚡ *OROCHI SMC SETUP ({symbol.upper()})*\n"
+                        f"📉 *Signal:* Bearish BOS + FVG Expansion\n\n"
+                        f"• *Entry:* ${live_price:,.2f}\n"
+                        f"• *Stop Loss:* ${sl:,.2f} (Swing High)\n"
+                        f"• *Take Profit:* ${tp:,.2f} (1:1.5 RR)\n\n"
+                        f"• *FVG Imbalance Zone:* ${fvg_high:,.2f} - ${fvg_low:,.2f}"
                     )
                     send_telegram_alert(msg)
                     last_alert_time[symbol] = now
 
 
 async def main():
-    # Initialize Telegram command listeners
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("botstart", start_cmd))
     app.add_handler(CommandHandler("botstop", stop_cmd))
@@ -181,11 +162,9 @@ async def main():
     await app.updater.start_polling()
 
     send_telegram_alert(
-        "⚡ *Instant Trade Scanner Online*\n"
-        "Send `/botstart` to begin receiving setups or `/botstop` to pause."
+        "🐉 *Orochi Framework Online*\n"
+        "Scanning real-time market structure, liquidity sweeps & FVGs."
     )
-
-    # Launch live ticker streams
     await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
 
 
