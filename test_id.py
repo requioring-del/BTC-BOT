@@ -15,7 +15,7 @@ if response.get("result") and len(response["result"]) > 0:
     send_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
         "chat_id": real_chat_id,
-        "text": "hey kitten",
+        "text": "hey daddy",
     }
     send_res = requests.post(send_url, json=payload).json()
     print("Delivery Status:", send_res)

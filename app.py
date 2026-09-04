@@ -1,149 +1,131 @@
+import asyncio
+import json
 import os
-import threading
-import time
-from flask import Flask
 import numpy as np
-import pandas as pd
 import requests
+import websockets
 
-app = Flask(__name__)
+# --- CONFIGURATION ---
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", "8811292743:AAEJBiVXN7j0hysvOpx7TjqHnN44goXX_-o"
+)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8695599623")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-latest_signal = "Scanning market for setups..."
+# Monitor multiple symbols
+SYMBOLS = ["btcusdt", "solusdt"]
 
 
 def send_telegram_alert(message):
-  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    print(f"Telegram credentials missing. Alert log:\n{message}", flush=True)
-    return
-
-  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-  payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-  try:
-    requests.post(url, json=payload, timeout=5)
-  except Exception as e:
-    print(f"Error sending Telegram alert: {e}", flush=True)
-
-
-def fetch_candles(granularity="900"):
-  """Fetches 15m OHLC candle data from Coinbase."""
-  url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={granularity}"
-  headers = {"User-Agent": "BTC-Trading-Bot"}
-  res = requests.get(url, headers=headers, timeout=10)
-
-  if res.status_code == 200:
-    data = res.json()
-    df = pd.DataFrame(
-        data, columns=["time", "low", "high", "open", "close", "volume"]
-    )
-    df["time"] = pd.to_datetime(df["time"], unit="s")
-    df = df.sort_values("time").reset_index(drop=True)
-    return df
-  return None
-
-
-def compute_indicators(df):
-  """Calculates EMA, RSI, and ATR using native pandas."""
-  # Exponential Moving Averages
-  df["EMA_9"] = df["close"].ewm(span=9, adjust=False).mean()
-  df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
-
-  # Relative Strength Index (RSI 14)
-  delta = df["close"].diff()
-  gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-  loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-  rs = gain / loss
-  df["RSI"] = 100 - (100 / (1 + rs))
-
-  # Average True Range (ATR 14)
-  high_low = df["high"] - df["low"]
-  high_close = np.abs(df["high"] - df["close"].shift())
-  low_close = np.abs(df["low"] - df["close"].shift())
-  ranges = pd.concat([high_low, high_close, low_close], axis=1)
-  true_range = np.max(ranges, axis=1)
-  df["ATR"] = true_range.rolling(14).mean()
-
-  return df
-
-
-def analyze_market_and_signal():
-  global latest_signal
-  df = fetch_candles()
-
-  if df is None or len(df) < 30:
-    return
-
-  df = compute_indicators(df)
-
-  latest = df.iloc[-1]
-  previous = df.iloc[-2]
-
-  entry_price = float(latest["close"])
-  atr = float(latest["ATR"])
-
-  bullish_cross = (previous["EMA_9"] <= previous["EMA_21"]) and (
-      latest["EMA_9"] > latest["EMA_21"]
-  )
-  bearish_cross = (previous["EMA_9"] >= previous["EMA_21"]) and (
-      latest["EMA_9"] < latest["EMA_21"]
-  )
-
-  # BUY Setup
-  if bullish_cross and latest["RSI"] > 50:
-    stop_loss = entry_price - (atr * 1.5)
-    take_profit = entry_price + (atr * 3.0)
-
-    alert_msg = (
-        f"🟢 <b>BUY SIGNAL DETECTED</b>\n\n"
-        f"<b>Asset:</b> BTC/USD (15m)\n"
-        f"<b>Entry:</b> ${entry_price:,.2f}\n"
-        f"<b>Stop-Loss (SL):</b> ${stop_loss:,.2f}\n"
-        f"<b>Take-Profit (TP):</b> ${take_profit:,.2f}\n"
-        f"<b>RSI:</b> {latest['RSI']:.1f}"
-    )
-    latest_signal = f"BUY @ ${entry_price:,.2f}"
-    send_telegram_alert(alert_msg)
-    time.sleep(900)
-
-  # SELL Setup
-  elif bearish_cross and latest["RSI"] < 50:
-    stop_loss = entry_price + (atr * 1.5)
-    take_profit = entry_price - (atr * 3.0)
-
-    alert_msg = (
-        f"🔴 <b>SELL SIGNAL DETECTED</b>\n\n"
-        f"<b>Asset:</b> BTC/USD (15m)\n"
-        f"<b>Entry:</b> ${entry_price:,.2f}\n"
-        f"<b>Stop-Loss (SL):</b> ${stop_loss:,.2f}\n"
-        f"<b>Take-Profit (TP):</b> ${take_profit:,.2f}\n"
-        f"<b>RSI:</b> {latest['RSI']:.1f}"
-    )
-    latest_signal = f"SELL @ ${entry_price:,.2f}"
-    send_telegram_alert(alert_msg)
-    time.sleep(900)
-
-
-def btc_monitor_loop():
-  time.sleep(5)
-  print("Trading Signal Scanner Active...", flush=True)
-  while True:
+    """Sends trade signal alerts to Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+    }
     try:
-      analyze_market_and_signal()
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-      print(f"Error in signal scan: {e}", flush=True)
-    time.sleep(60)
+        print(f"\n[ERROR] Telegram send error: {e}")
 
 
-threading.Thread(target=btc_monitor_loop, daemon=True).start()
+def calculate_ema(prices, period):
+    """Calculates Exponential Moving Average."""
+    prices = np.array(prices, dtype=float)
+    weights = np.exp(np.linspace(-1.0, 0.0, period))
+    weights /= weights.sum()
+    ema = np.convolve(prices, weights, mode="full")[: len(prices)]
+    ema[:period] = ema[period]
+    return ema[-1]
 
 
-@app.route("/")
-def home():
-  return f"BTC Signal Bot Active. Status: {latest_signal}"
+def calculate_rsi(prices, period=14):
+    """Calculates Relative Strength Index."""
+    deltas = np.diff(prices)
+    seed = deltas[: period + 1]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down != 0 else 0
+    rsi = np.zeros_like(prices)
+    rsi[:period] = 100.0 - (100.0 / (1.0 + rs))
+
+    for i in range(period, len(prices)):
+        delta = deltas[i - 1]
+        if delta > 0:
+            upval = delta
+            downval = 0.0
+        else:
+            upval = 0.0
+            downval = -delta
+
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down != 0 else 0
+        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return rsi[-1]
+
+
+async def fetch_historical_closes(symbol):
+    """Fetches last 50 closed 15m candles from Binance API."""
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=15m&limit=50"
+    res = requests.get(url).json()
+    # Extract closing prices (index 4 in Binance kline response)
+    closes = [float(candle[4]) for candle in res]
+    return closes
+
+
+async def monitor_symbol(symbol):
+    # Binance websocket streams 15m candle updates
+    stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@kline_15m"
+
+    async with websockets.connect(stream_url) as ws:
+        print(f"[{symbol.upper()}] Monitoring 15m signals...")
+
+        while True:
+            response = await ws.recv()
+            data = json.loads(response)
+            kline = data["k"]
+
+            # Only calculate on candle CLOSE ('x': True)
+            if kline["x"]:
+                closes = await fetch_historical_closes(symbol)
+                price = closes[-1]
+
+                ema9 = calculate_ema(closes, 9)
+                ema21 = calculate_ema(closes, 21)
+                rsi = calculate_rsi(closes, 14)
+
+                # Bullish Crossover (EMA9 > EMA21 and RSI not overbought)
+                if ema9 > ema21 and rsi < 68:
+                    msg = (
+                        f"🟢 *BULLISH TRADE SETUP ({symbol.upper()})*\n\n"
+                        f"• *Price:* ${price:,.2f}\n"
+                        f"• *Signal:* 9 EMA crossed above 21 EMA\n"
+                        f"• *RSI (14):* {rsi:.1f} (Healthy Momentum)\n"
+                        f"• *Timeframe:* 15m Candle Close"
+                    )
+                    send_telegram_alert(msg)
+
+                # Bearish Crossover (EMA9 < EMA21 and RSI not oversold)
+                elif ema9 < ema21 and rsi > 32:
+                    msg = (
+                        f"🔴 *BEARISH TRADE SETUP ({symbol.upper()})*\n\n"
+                        f"• *Price:* ${price:,.2f}\n"
+                        f"• *Signal:* 9 EMA crossed below 21 EMA\n"
+                        f"• *RSI (14):* {rsi:.1f} (Downside Momentum)\n"
+                        f"• *Timeframe:* 15m Candle Close"
+                    )
+                    send_telegram_alert(msg)
+
+
+async def main():
+    send_telegram_alert(
+        "🚀 *Trade Setup Bot Online*\nMonitoring BTC & SOL on 15m timeframe."
+    )
+    # Run streams concurrently for BTC and SOL
+    await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
 
 
 if __name__ == "__main__":
-  port = int(os.environ.get("PORT", 10000))
-  app.run(host="0.0.0.0", port=port)
+    asyncio.run(main())
