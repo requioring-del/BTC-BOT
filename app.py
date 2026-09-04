@@ -40,7 +40,7 @@ def send_telegram_alert(message):
 
 # --- SHUTDOWN & OFFLINE ALERTS ---
 def handle_exit_signal(sig, frame):
-    """Sends a emergency alert when Render stops or restarts the bot."""
+    """Sends an emergency alert when Render stops or restarts the bot."""
     print("[SYSTEM] Exit signal received. Sending offline notification...")
     send_telegram_alert(
         "⚠️ *SYSTEM ALERT: Orochi Has Gone Offline*\n\n"
@@ -81,7 +81,7 @@ def fetch_klines(symbol, limit=50):
     opens = [float(c[1]) for c in res]
     highs = [float(c[2]) for c in res]
     lows = [float(c[3]) for c in res]
-    closes = [float(c[4]) for c attacking in res]
+    closes = [float(c[4]) for c in res]
     return opens, highs, lows, closes
 
 
@@ -129,9 +129,7 @@ async def monitor_symbol(symbol):
     stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
 
     async with websockets.connect(stream_url) as ws:
-        print(
-            f"[{symbol.upper()}] Orochi High-Target Stream Connected..."
-        )
+        print(f"[{symbol.upper()}] Orochi High-Target Stream Connected...")
 
         while True:
             response = await ws.recv()
@@ -158,7 +156,7 @@ async def monitor_symbol(symbol):
             # --- BULLISH SETUP (Targeting 2.5% to 5.0% gains) ---
             if structure_signal == "BULLISH_BOS" and fvg_type == "BULLISH_FVG":
                 sl = invalidation_level
-                
+
                 # Scaled take-profit targets for high-gain unleveraged returns
                 tp1 = live_price * 1.025  # +2.5% Gain
                 tp2 = live_price * 1.050  # +5.0% Gain
