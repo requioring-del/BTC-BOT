@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 import numpy as np
 import requests
 import websockets
@@ -10,13 +11,15 @@ TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", "8811292743:AAEJBiVXN7j0hysvOpx7TjqHnN44goXX_-o"
 )
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8695599623")
-
-# Monitor multiple symbols
 SYMBOLS = ["btcusdt", "solusdt"]
+
+# Alert cooldown per symbol (in seconds) to avoid spamming single crossovers
+COOLDOWN_SECONDS = 300  # 5 minutes
+last_alert_time = {"btcusdt": 0, "solusdt": 0}
 
 
 def send_telegram_alert(message):
-    """Sends trade signal alerts to Telegram."""
+    """Sends real-time trade signal alerts to Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -30,7 +33,6 @@ def send_telegram_alert(message):
 
 
 def calculate_ema(prices, period):
-    """Calculates Exponential Moving Average."""
     prices = np.array(prices, dtype=float)
     weights = np.exp(np.linspace(-1.0, 0.0, period))
     weights /= weights.sum()
@@ -40,7 +42,6 @@ def calculate_ema(prices, period):
 
 
 def calculate_rsi(prices, period=14):
-    """Calculates Relative Strength Index."""
     deltas = np.diff(prices)
     seed = deltas[: period + 1]
     up = seed[seed >= 0].sum() / period
@@ -66,64 +67,80 @@ def calculate_rsi(prices, period=14):
     return rsi[-1]
 
 
-async def fetch_historical_closes(symbol):
-    """Fetches last 50 closed 15m candles from Binance API."""
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=15m&limit=50"
+def fetch_historical_prices(symbol):
+    """Fetches recent prices and highs/lows for calculations."""
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1m&limit=50"
     res = requests.get(url).json()
-    # Extract closing prices (index 4 in Binance kline response)
     closes = [float(candle[4]) for candle in res]
-    return closes
+    lows = [float(candle[3]) for candle in res]
+    highs = [float(candle[2]) for candle in res]
+    return closes, lows, highs
 
 
 async def monitor_symbol(symbol):
-    # Binance websocket streams 15m candle updates
-    stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@kline_15m"
+    # Connect directly to the real-time trade ticker stream
+    stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
 
     async with websockets.connect(stream_url) as ws:
-        print(f"[{symbol.upper()}] Monitoring 15m signals...")
+        print(f"[{symbol.upper()}] Monitoring live trade ticks...")
 
         while True:
             response = await ws.recv()
             data = json.loads(response)
-            kline = data["k"]
+            live_price = float(data["p"])
 
-            # Only calculate on candle CLOSE ('x': True)
-            if kline["x"]:
-                closes = await fetch_historical_closes(symbol)
-                price = closes[-1]
+            now = time.time()
+            if now - last_alert_time[symbol] < COOLDOWN_SECONDS:
+                continue  # Skip evaluation if in cooldown window
 
-                ema9 = calculate_ema(closes, 9)
-                ema21 = calculate_ema(closes, 21)
-                rsi = calculate_rsi(closes, 14)
+            closes, lows, highs = fetch_historical_prices(symbol)
+            closes[-1] = live_price  # Replace latest candle close with live price
 
-                # Bullish Crossover (EMA9 > EMA21 and RSI not overbought)
-                if ema9 > ema21 and rsi < 68:
+            ema9 = calculate_ema(closes, 9)
+            ema21 = calculate_ema(closes, 21)
+            rsi = calculate_rsi(closes, 14)
+
+            # Bullish Trigger
+            if ema9 > ema21 and rsi < 68:
+                sl = min(lows[-5:])  # Local swing low
+                risk = live_price - sl
+                if risk > 0:
+                    tp = live_price + (risk * 1.5)  # 1:1.5 Risk-to-Reward Ratio
+
                     msg = (
-                        f"🟢 *BULLISH TRADE SETUP ({symbol.upper()})*\n\n"
-                        f"• *Price:* ${price:,.2f}\n"
+                        f"🟢 *REAL-TIME BULLISH SETUP ({symbol.upper()})*\n\n"
+                        f"• *Entry Price:* ${live_price:,.2f}\n"
+                        f"• *Stop Loss (SL):* ${sl:,.2f}\n"
+                        f"• *Take Profit (TP):* ${tp:,.2f} (1:1.5 RR)\n\n"
                         f"• *Signal:* 9 EMA crossed above 21 EMA\n"
-                        f"• *RSI (14):* {rsi:.1f} (Healthy Momentum)\n"
-                        f"• *Timeframe:* 15m Candle Close"
+                        f"• *RSI (14):* {rsi:.1f}"
                     )
                     send_telegram_alert(msg)
+                    last_alert_time[symbol] = now
 
-                # Bearish Crossover (EMA9 < EMA21 and RSI not oversold)
-                elif ema9 < ema21 and rsi > 32:
+            # Bearish Trigger
+            elif ema9 < ema21 and rsi > 32:
+                sl = max(highs[-5:])  # Local swing high
+                risk = sl - live_price
+                if risk > 0:
+                    tp = live_price - (risk * 1.5)  # 1:1.5 Risk-to-Reward Ratio
+
                     msg = (
-                        f"🔴 *BEARISH TRADE SETUP ({symbol.upper()})*\n\n"
-                        f"• *Price:* ${price:,.2f}\n"
+                        f"🔴 *REAL-TIME BEARISH SETUP ({symbol.upper()})*\n\n"
+                        f"• *Entry Price:* ${live_price:,.2f}\n"
+                        f"• *Stop Loss (SL):* ${sl:,.2f}\n"
+                        f"• *Take Profit (TP):* ${tp:,.2f} (1:1.5 RR)\n\n"
                         f"• *Signal:* 9 EMA crossed below 21 EMA\n"
-                        f"• *RSI (14):* {rsi:.1f} (Downside Momentum)\n"
-                        f"• *Timeframe:* 15m Candle Close"
+                        f"• *RSI (14):* {rsi:.1f}"
                     )
                     send_telegram_alert(msg)
+                    last_alert_time[symbol] = now
 
 
 async def main():
     send_telegram_alert(
-        "🚀 *Trade Setup Bot Online*\nMonitoring BTC & SOL on 15m timeframe."
+        "⚡ *Instant Trade Scanner Online*\nMonitoring live BTC & SOL trades with instant TP/SL setup generation."
     )
-    # Run streams concurrently for BTC and SOL
     await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
 
 
