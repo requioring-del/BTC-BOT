@@ -2,8 +2,8 @@ import os
 import threading
 import time
 from flask import Flask
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import requests
 
 app = Flask(__name__)
@@ -15,7 +15,6 @@ latest_signal = "Scanning market for setups..."
 
 
 def send_telegram_alert(message):
-  """Sends structured trading signal to Telegram."""
   if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     print(f"Telegram credentials missing. Alert log:\n{message}", flush=True)
     return
@@ -28,16 +27,14 @@ def send_telegram_alert(message):
     print(f"Error sending Telegram alert: {e}", flush=True)
 
 
-def fetch_candles(granularity="300", limit=100):
-  """Fetches historical OHLC candle data from Coinbase public API."""
-  # granularity: 300 = 5m, 900 = 15m, 3600 = 1h
+def fetch_candles(granularity="900"):
+  """Fetches 15m OHLC candle data from Coinbase."""
   url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={granularity}"
   headers = {"User-Agent": "BTC-Trading-Bot"}
   res = requests.get(url, headers=headers, timeout=10)
 
   if res.status_code == 200:
     data = res.json()
-    # Coinbase returns [time, low, high, open, close, volume]
     df = pd.DataFrame(
         data, columns=["time", "low", "high", "open", "close", "volume"]
     )
@@ -47,27 +44,45 @@ def fetch_candles(granularity="300", limit=100):
   return None
 
 
+def compute_indicators(df):
+  """Calculates EMA, RSI, and ATR using native pandas."""
+  # Exponential Moving Averages
+  df["EMA_9"] = df["close"].ewm(span=9, adjust=False).mean()
+  df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+  # Relative Strength Index (RSI 14)
+  delta = df["close"].diff()
+  gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+  loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+  rs = gain / loss
+  df["RSI"] = 100 - (100 / (1 + rs))
+
+  # Average True Range (ATR 14)
+  high_low = df["high"] - df["low"]
+  high_close = np.abs(df["high"] - df["close"].shift())
+  low_close = np.abs(df["low"] - df["close"].shift())
+  ranges = pd.concat([high_low, high_close, low_close], axis=1)
+  true_range = np.max(ranges, axis=1)
+  df["ATR"] = true_range.rolling(14).mean()
+
+  return df
+
+
 def analyze_market_and_signal():
   global latest_signal
-  df = fetch_candles(granularity="900", limit=100)  # 15-minute timeframe
+  df = fetch_candles()
 
-  if df is None or len(df) < 50:
+  if df is None or len(df) < 30:
     return
 
-  # Calculate Indicators
-  df["EMA_9"] = ta.ema(df["close"], length=9)
-  df["EMA_21"] = ta.ema(df["close"], length=21)
-  df["RSI"] = ta.rsi(df["close"], length=14)
-  df["ATR"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+  df = compute_indicators(df)
 
-  # Extract latest closed candle values
   latest = df.iloc[-1]
   previous = df.iloc[-2]
 
   entry_price = float(latest["close"])
   atr = float(latest["ATR"])
 
-  # Signal Conditions
   bullish_cross = (previous["EMA_9"] <= previous["EMA_21"]) and (
       latest["EMA_9"] > latest["EMA_21"]
   )
@@ -75,10 +90,10 @@ def analyze_market_and_signal():
       latest["EMA_9"] < latest["EMA_21"]
   )
 
-  # BUY Setup Check
+  # BUY Setup
   if bullish_cross and latest["RSI"] > 50:
     stop_loss = entry_price - (atr * 1.5)
-    take_profit = entry_price + (atr * 3.0)  # 1:2 Risk-to-Reward Ratio
+    take_profit = entry_price + (atr * 3.0)
 
     alert_msg = (
         f"🟢 <b>BUY SIGNAL DETECTED</b>\n\n"
@@ -86,18 +101,16 @@ def analyze_market_and_signal():
         f"<b>Entry:</b> ${entry_price:,.2f}\n"
         f"<b>Stop-Loss (SL):</b> ${stop_loss:,.2f}\n"
         f"<b>Take-Profit (TP):</b> ${take_profit:,.2f}\n"
-        f"<b>Risk/Reward Ratio:</b> 1:2\n"
         f"<b>RSI:</b> {latest['RSI']:.1f}"
     )
-
-    latest_signal = f"BUY @ ${entry_price:,.2f} | SL: ${stop_loss:,.2f} | TP: ${take_profit:,.2f}"
+    latest_signal = f"BUY @ ${entry_price:,.2f}"
     send_telegram_alert(alert_msg)
-    time.sleep(900)  # Pause scans for 15 minutes to avoid duplicate alerts
+    time.sleep(900)
 
-  # SELL Setup Check
+  # SELL Setup
   elif bearish_cross and latest["RSI"] < 50:
     stop_loss = entry_price + (atr * 1.5)
-    take_profit = entry_price - (atr * 3.0)  # 1:2 Risk-to-Reward Ratio
+    take_profit = entry_price - (atr * 3.0)
 
     alert_msg = (
         f"🔴 <b>SELL SIGNAL DETECTED</b>\n\n"
@@ -105,11 +118,9 @@ def analyze_market_and_signal():
         f"<b>Entry:</b> ${entry_price:,.2f}\n"
         f"<b>Stop-Loss (SL):</b> ${stop_loss:,.2f}\n"
         f"<b>Take-Profit (TP):</b> ${take_profit:,.2f}\n"
-        f"<b>Risk/Reward Ratio:</b> 1:2\n"
         f"<b>RSI:</b> {latest['RSI']:.1f}"
     )
-
-    latest_signal = f"SELL @ ${entry_price:,.2f} | SL: ${stop_loss:,.2f} | TP: ${take_profit:,.2f}"
+    latest_signal = f"SELL @ ${entry_price:,.2f}"
     send_telegram_alert(alert_msg)
     time.sleep(900)
 
@@ -122,16 +133,15 @@ def btc_monitor_loop():
       analyze_market_and_signal()
     except Exception as e:
       print(f"Error in signal scan: {e}", flush=True)
-    time.sleep(60)  # Scan market every minute
+    time.sleep(60)
 
 
-# Start scanner thread
 threading.Thread(target=btc_monitor_loop, daemon=True).start()
 
 
 @app.route("/")
 def home():
-  return f"BTC Signal Bot Active. Latest Status: {latest_signal}"
+  return f"BTC Signal Bot Active. Status: {latest_signal}"
 
 
 if __name__ == "__main__":
